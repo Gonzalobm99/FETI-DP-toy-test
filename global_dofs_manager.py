@@ -170,10 +170,13 @@ class GlobalDofsManager:
         n_global_primals = self.get_num_primals()
         n_local_primals = 4
 
-        raise ValueError("To be implemented!")
+        values = np.ones(n_local_primals, dtype=np.float64)
+        rows = self._primal_dofs[subdomain_id]
+        cols = np.arange(n_local_primals)
 
-        # Ap = ...
-        # return Ap
+        Ap = scipy.sparse.csr_matrix((values, (rows, cols)), shape=(n_global_primals, n_local_primals))
+
+        return Ap
 
     def create_Bd(self, subdomain_id: int) -> SparseMatrix:
         """Creates the local (dual) Boolean operator Bd of a given subdomain.

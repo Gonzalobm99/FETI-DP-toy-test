@@ -85,6 +85,7 @@ class SubDomain:
         corner_dofs = np.empty(4, dtype=np.int32)
         for i in range(4):
             corner_dofs[i] = dolfinx.fem.locate_dofs_geometrical(self.V, markers[i])[0]
+
         return corner_dofs
 
     def get_faces_dofs(self) -> list[npt.NDArray[np.int32]]:
@@ -120,7 +121,9 @@ class SubDomain:
                 degrees-of-freedom.
         """
 
-        raise ValueError("To be implemented!!")
+        corner_dofs = self.get_corners_dofs()
+
+        return np.array(corner_dofs)
 
     def get_remainder_dofs(self) -> npt.NDArray[np.int32]:
         """Gets the local remainder degrees-of-freedom of the subdomain.
@@ -129,7 +132,12 @@ class SubDomain:
             npt.NDArray[np.int32]: Sorted remainder dofs.
         """
 
-        raise ValueError("To be implemented!!")
+        all_dofs = self.get_all_dofs()
+        corner_dofs = self.get_corners_dofs()
+
+        rem_dofs = [x for x in all_dofs if x not in corner_dofs]
+
+        return np.array(rem_dofs)
 
     def get_dual_dofs(
         self,
@@ -152,9 +160,33 @@ class SubDomain:
 
         dual_dofs = []
         for face_id in range(4):
-            raise ValueError("To be implemented!!")
+            dual_dofs.append(np.setdiff1d(faces_dofs[face_id], primal_dofs))
 
         return dual_dofs
+    
+    def get_prec_dofs(
+        self,
+    ) -> list[npt.NDArray[np.int32]]:
+        """Gets the interior and dual degrees-of-freedom of the
+        subdomain.
+
+        Returns:
+            npt.NDArray[np.int32]:
+                Interior degrees-of-freedom. 
+                One sorted and unique array.
+            npt.NDArray[np.int32]:
+                Dual degrees-of-freedom.
+                One sorted and unique array.
+        """
+
+        interf_dofs = np.hstack(self.get_dual_dofs())
+        interf_dofs = np.unique(np.sort(interf_dofs))
+
+        rem_dofs = self.get_remainder_dofs()
+
+        interior_dofs = np.array([x for x in rem_dofs if x not in interf_dofs])
+
+        return interior_dofs, interf_dofs
 
     def create_K_and_f(self) -> tuple[SparseMatrix, npt.NDArray[np.float64]]:
         """Assembles the stiffness matrix and right-hand-side vector of the

@@ -1,156 +1,305 @@
 import numpy as np
 import numpy.typing as npt
+import scipy.linalg
 import scipy.sparse
+import scipy
+import scipy.sparse.linalg
 
 import dolfinx.fem
 
 from global_dofs_manager import GlobalDofsManager
 from utils import write_solution
 
+from scipy.sparse.linalg import LinearOperator
+from scipy.sparse.linalg import cg
+
 type SparseMatrix = scipy.sparse._csr.csr_matrix
 
+class residual_tracker:
 
-def create_primal_Schur(
-    gbl_dofs_mngr: GlobalDofsManager,
-    Krr: SparseMatrix,
-    Krp: SparseMatrix,
-    Kpp: SparseMatrix,
-) -> SparseMatrix:
-    """Creates the global primal Schur complement.
-
-    Args:
-        gbl_dofs_mngr (GlobalDofsManager): Global dofs manager.
-        Krr (SparseMatrix): Local stiffnes matrix for the remainder dofs.
-        Krp (SparseMatrix): Local stiffnes matrix for the remainder-primal
-            dofs.
-        Kpp (SparseMatrix): Local stiffnes matrix for the primal dofs.
-
-    Returns:
-        SparseMatrix: Global primal Schur complement.
+    """Class for tracking the iterative solver residuals and interations.
     """
 
-    # Global Schur.
-    P = gbl_dofs_mngr.get_num_primals()
-    SPP = scipy.sparse.csr_matrix((P, P), dtype=Krr.dtype)
+    def __init__(self):
+        self.niter = 0
+        self.res = []
 
-    raise ValueError("To be implemented!")
-
-    # Primal solution.
-    # Urp = ...
-    # Local Schur.
-    # Spp = ...
-
-    # ...
-
-    return SPP
+    def __call__(self, rk=None):
+        self.niter += 1
+        self.res.append(rk)
 
 
+class Assembler:
 
-
-def create_F_and_d_bar(
-    gbl_dofs_mngr: GlobalDofsManager,
-) -> tuple[SparseMatrix, npt.NDArray[np.float64]]:
-    """Assembles the stiffness matrix and right-hand-side vector of the global
-    dual problem.
-
-    Args:
-        gbl_dofs_mngr (GlobalDofsManager): Global dofs manager.
-
-    Returns:
-        tuple[SparseMatrix, npt.NDArray[np.float64]]: Stiffness matrix and
-            right-hand-side vector of the dual problem.
+    """Class for managing the assembling and use of the fetidp operators.
     """
 
-    subdomain = gbl_dofs_mngr.subdomain
+    def __init__(
+        self, 
+        gbl_dofs_mngr: GlobalDofsManager
+    ) -> None: 
+        
+        """Initializes the class.
+
+        Args:
+            gbl_dofs_mngr (GlobalDofsManager): Global dofs manager.
+        """
+        
+        self.gbl_dofs_mngr = gbl_dofs_mngr
+        self.assemble_subdomain()
+        self.assemble_primal_Schur()
+        self.assemble_dbar()
+
+    def assemble_subdomain(self) -> None:
+
+        """Assembles and stores the subdomain operators.
+        """
+
+        subdomain = self.gbl_dofs_mngr.subdomain
+
+        K, f = subdomain.K, subdomain.f
+
+        rem_dofs = subdomain.get_remainder_dofs()
+        primal_dofs = subdomain.get_primal_dofs()
+
+        int_dofs, dual_dofs = subdomain.get_prec_dofs()
+
+        Kr = K[rem_dofs, :]
+        Krr = Kr[:, rem_dofs]
+        self.Krp = Kr[:, primal_dofs]
+        Kp = K[primal_dofs, :]
+        self.Kpp = Kp[:, primal_dofs]
+        self.invKrr = scipy.sparse.linalg.inv(Krr)
+
+        Ki = K[int_dofs, :]
+        Kii = Ki[:, int_dofs]
+        self.Kid = Ki[:, dual_dofs]
+        Kd = K[dual_dofs, :]
+        self.Kdd = Kd[:, dual_dofs]
+        self.invKii = scipy.sparse.linalg.inv(Kii)
+
+        self.Sdd = self.Kdd - self.Kid.T @ self.invKii @ self.Kid
+
+        self.fr = f[rem_dofs]
+        self.fp = f[primal_dofs]
+
+        self.Tdr = subdomain.create_Tdr()
+
+        Urp = self.invKrr @ self.Krp
+        self.Spp = self.Kpp - self.Krp.T @ Urp
+
+        self.Aps = []
+        self.Bds = []
+        self.Brs = []
+        self.KrPs = []
+
+        N = self.gbl_dofs_mngr.get_num_subdomains()
+        for s_id in range(N):
+            Ap = self.gbl_dofs_mngr.create_Ap(s_id)
+            Bd = self.gbl_dofs_mngr.create_Bd(s_id)
+            self.Aps.append(Ap)
+            self.Bds.append(Bd)
+            self.Brs.append(Bd @ self.Tdr)
+            self.KrPs.append(self.Krp @ Ap.T)
+
+    def assemble_primal_Schur(self) -> None:
+
+        """Assembles and stores the primal Schur operator.
+        """
+
+        P = self.gbl_dofs_mngr.get_num_primals()
+        act_primal_dofs = self.gbl_dofs_mngr.get_active_primal_dofs()
+
+        SPP = scipy.sparse.csr_matrix((P, P), dtype=self.invKrr.dtype)
+
+        N = self.gbl_dofs_mngr.get_num_subdomains()
+        for s_id in range(N):
+            Ap = self.Aps[s_id]
+            SPP = SPP + Ap @ self.Spp @ Ap.T
+
+        SPP = SPP[act_primal_dofs, :]
+        self.SPP = SPP[:, act_primal_dofs]
+
+    def assemble_dbar(self) -> None:
+
+        """Assembles the right hand side of the global dual problem.
+        """
+
+        N = self.gbl_dofs_mngr.get_num_subdomains()
+        P = self.gbl_dofs_mngr.get_num_primals()
+        n_dual = self.gbl_dofs_mngr.get_num_duals()
+        act_primal_dofs = self.gbl_dofs_mngr.get_active_primal_dofs()
+
+        y = np.zeros((P,))
+
+        for s_id in range(N):
+            Ap = self.Aps[s_id]
+            KrP = self.KrPs[s_id]
+
+            y = y + Ap @ self.fp - KrP.T @ self.invKrr @ self.fr
+
+        sol = scipy.sparse.linalg.spsolve(self.SPP, y[act_primal_dofs])
+        y = np.zeros((P,))
+        y[act_primal_dofs] = sol
+        dbar = np.zeros((n_dual,))
+
+        for s_id in range(N):
+            KrP = self.KrPs[s_id]
+            Br = self.Brs[s_id]
+
+            subdomain_y = self.fr - KrP @ y
+
+            dbar = dbar + Br @ self.invKrr @ subdomain_y
+
+        self.dbar = dbar
+
+    def apply_M(self, x: np.ndarray) -> np.ndarray: 
+
+        """Dirichlet preconditioner.
+
+        Args:
+            x (np.ndarray): Vector to which the preconditioner is applied.
+
+        Returns:
+            y (np.ndarray): M * x.
+        """
+
+        N = self.gbl_dofs_mngr.get_num_subdomains()
+        n_dual = self.gbl_dofs_mngr.get_num_duals()
+
+        y = np.zeros((n_dual,))
+
+        for s_id in range(N):
+            Bd = self.Bds[s_id]
+
+            y = y + Bd @ self.Sdd @ Bd.T @ x
+
+        return y
+    
+    def apply_F(self, x: np.ndarray) -> np.ndarray: 
+
+        """Global dual problem left hand side operator.
+
+        Args:
+            x (np.ndarray): Vector to which F is applied.
+
+        Returns:
+            y (np.ndarray): F * x.
+        """
+
+        N = self.gbl_dofs_mngr.get_num_subdomains()
+        P = self.gbl_dofs_mngr.get_num_primals()
+        n_dual = self.gbl_dofs_mngr.get_num_duals()
+        act_primal_dofs = self.gbl_dofs_mngr.get_active_primal_dofs()
+
+        y1 = np.zeros((n_dual,))
+
+        for s_id in range(N):
+            Br = self.Brs[s_id]
+
+            y1 = y1 + Br @ self.invKrr @ Br.T @ x
+
+        y2 = np.zeros((P,))
+
+        for s_id in range(N):
+            Br = self.Brs[s_id]
+            KrP = self.KrPs[s_id]
+
+            y2 = y2 + KrP.T @ self.invKrr @ Br.T @ x
+
+        sol = scipy.sparse.linalg.spsolve(self.SPP, y2[act_primal_dofs])
+        y2 = np.zeros((P,))
+        y2[act_primal_dofs] = sol
+
+        y = np.zeros((n_dual,))
+
+        for s_id in range(N):
+            Br = self.Brs[s_id]
+            KrP = self.KrPs[s_id]
+
+            y = y + Br @ self.invKrr @ KrP @ y2
+
+        return y + y1
+    
+    def reconstruct_uP(
+        self,    
+        lambda_: npt.NDArray[np.float64],
+    ) -> npt.NDArray[np.float64]:
+        
+        """Reconstructs the global primal solution vector from the multipliers
+        lambda_ at the interfaces (the solution of the global dual problem).
+
+        Args:
+            lambda_ (npt.NDArray[np.float64]): Dual problem solution vector.
+
+        Returns:
+            npt.NDArray[np.float64]: Global primal solution vector.
+        """
+        
+        N = self.gbl_dofs_mngr.get_num_subdomains()
+        P = self.gbl_dofs_mngr.get_num_primals()
+        act_primal_dofs = self.gbl_dofs_mngr.get_active_primal_dofs()
+
+        y = np.zeros((P,))
+
+        for s_id in range(N):
+            Ap = self.Aps[s_id]
+            Br = self.Brs[s_id]
+            KrP = self.KrPs[s_id]
+
+            y = y + Ap @ self.fp + KrP.T @ self.invKrr @ (Br.T @ lambda_ - self.fr)
+
+        sol = scipy.sparse.linalg.spsolve(self.SPP, y[act_primal_dofs])
+        uP = np.zeros((P,))
+        uP[act_primal_dofs] = sol
+
+        return uP
+    
+    def reconstruct_Us(
+        self, 
+        uP: npt.NDArray[np.float64],
+        lambda_: npt.NDArray[np.float64],
+    ) -> list[npt.NDArray[np.float64]]:
+        
+        """Reconstructs the full solution vector of every subdomain, once the
+        multipliers lambda_ at the interfaces (the solution of the global dual
+        problem), and the global primal solution uP have been computed.
+
+        Args:
+            uP (npt.NDArray[np.float64]): Global primal solution vector.
+            lambda_ (npt.NDArray[np.float64]): Dual problem solution vector.
 
 
-    K, f = subdomain.K, subdomain.f
+        Returns:
+            list[npt.NDArray[np.float64]]: Vector of solutions for every subdomain.
+        """
+        
+        N = self.gbl_dofs_mngr.get_num_subdomains()
 
-    rem_dofs = subdomain.get_remainder_dofs()
-    primal_dofs = subdomain.get_primal_dofs()
+        subdomain = self.gbl_dofs_mngr.subdomain
+        rem_dofs = subdomain.get_remainder_dofs()
+        primal_dofs = subdomain.get_primal_dofs()
 
-    raise ValueError("To be implemented")
+        us = []
 
-    # Krr = ...
-    # Krp = ...
-    # Kpp = ...
+        for s_id in range(N):
+            Ap = self.Aps[s_id]
+            Br = self.Brs[s_id]
+            KrP = self.KrPs[s_id]
 
-    # fr = ...
-    # fp = ...
+            u = np.zeros((rem_dofs.size + primal_dofs.size,))
+            u[primal_dofs] = Ap.T @ uP
+            u[rem_dofs] = self.invKrr @ (self.fr - KrP @ uP - Br.T @ lambda_)
+            
+            us.append(u)
 
-    Tdr = subdomain.create_Tdr()
-
-    # ...
-
-    # return F, dbar
-
-
-def reconstruct_uP(
-    gbl_dofs_mngr: GlobalDofsManager,
-    lambda_: npt.NDArray[np.float64],
-) -> npt.NDArray[np.float64]:
-    """Reconstructs the global primal solution vector from the multipliers
-    lambda_ at the interfaces (the solution of the global dual problem).
-
-    Args:
-        gbl_dofs_mngr (GlobalDofsManager): Global dofs manager.
-        lambda_ (npt.NDArray[np.float64]): Dual problem solution vector.
-
-    Returns:
-        npt.NDArray[np.float64]: Global primal solution vector.
-    """
-
-    subdomain = gbl_dofs_mngr.subdomain
-
-    raise ValueError("To be implemented!")
-
-    # return UP
-
-
-def reconstruct_Us(
-    gbl_dofs_mngr: GlobalDofsManager,
-    uP: npt.NDArray[np.float64],
-    lambda_: npt.NDArray[np.float64],
-) -> list[npt.NDArray[np.float64]]:
-    """Reconstructs the full solution vector of every subdomain, once the
-    multipliers lambda_ at the interfaces (the solution of the global dual
-    problem), and the global primal solution uP have been computed.
-
-    Args:
-        gbl_dofs_mngr (GlobalDofsManager): Global dofs manager.
-        uP (npt.NDArray[np.float64]): Global primal solution vector.
-        lambda_ (npt.NDArray[np.float64]): Dual problem solution vector.
-
-
-    Returns:
-        list[npt.NDArray[np.float64]]: Vector of solutions for every subdomain.
-    """
-
-    subdomain = gbl_dofs_mngr.subdomain
-
-    rem_dofs = subdomain.get_remainder_dofs()
-    primal_dofs = subdomain.get_primal_dofs()
-
-    raise ValueError("To be implemented.")
-
-    us = []
-    N = gbl_dofs_mngr.get_num_subdomains()
-    for s_id in range(N):
-        Ap = gbl_dofs_mngr.create_Ap(s_id)
-
-        u = np.zeros(K.shape[0], dtype=K.dtype)
-        u[primal_dofs] = Ap.T @ uP
-
-        # u[rem_dofs] = ...
-
-        us.append(u)
-
-    return us
-
+        return us
+        
 
 def reconstruct_solutions(
     gbl_dofs_mngr: GlobalDofsManager,
     lambda_: npt.NDArray[np.float64],
+    assembler: Assembler
 ) -> list[dolfinx.fem.Function]:
     """Reconstructs the solution function of every subdomain, starting from the
     multipliers lambda_ at the interfaces (the solution of the global dual
@@ -159,6 +308,7 @@ def reconstruct_solutions(
     Args:
         gbl_dofs_mngr (GlobalDofsManager): Global dofs manager.
         lambda_ (npt.NDArray[np.float64]): Solution of the dual problem.
+        assembler (Assembler): Fetidp operators manager.
 
     Returns:
         list[dolfinx.fem.Function]: List of functions describing the solution
@@ -167,8 +317,8 @@ def reconstruct_solutions(
             at its corresponding position.
     """
 
-    uP = reconstruct_uP(gbl_dofs_mngr, lambda_)
-    Urs = reconstruct_Us(gbl_dofs_mngr, uP, lambda_)
+    uP = assembler.reconstruct_uP(lambda_)
+    Urs = assembler.reconstruct_Us(uP, lambda_)
 
     us = []
     N = gbl_dofs_mngr.get_num_subdomains()
@@ -200,7 +350,9 @@ def write_output_subdomains(us: list[dolfinx.fem.Function]) -> None:
 
 def fetidp_solver(n: list[int], N: list[int, int], degree: int) -> None:
     """Solves the Poisson problem with N subdomains per direction using
-    a non-preconditioned FETI-DP solver.
+    a preconditioned conjugate gradient FETI-DP solver.
+
+    The Dirichlet preconditioner is used.
 
     Every subdomain is considered to have n elements per direction, and
     the input degree is used for discretizing the solution.
@@ -221,8 +373,23 @@ def fetidp_solver(n: list[int], N: list[int, int], degree: int) -> None:
 
     gbl_dofs_mngr = GlobalDofsManager.create_unit_square(n, degree, N)
 
-    F, dbar = create_F_and_d_bar(gbl_dofs_mngr)
-    lambda_ = scipy.sparse.linalg.spsolve(F, dbar)
+    assembler = Assembler(gbl_dofs_mngr)
 
-    us = reconstruct_solutions(gbl_dofs_mngr, lambda_)
+    check = residual_tracker()
+
+    n_duals = gbl_dofs_mngr.get_num_duals()
+    M = LinearOperator((n_duals, n_duals), matvec = assembler.apply_M)
+    F = LinearOperator((n_duals, n_duals), matvec = assembler.apply_F)
+    dbar = assembler.dbar
+    
+    lambda_, exit_code = cg(F, dbar, M = M, callback = check)
+
+    if exit_code == 0:
+        print("PCG has converged")
+        print(f"Number of iterations: {check.niter}")
+    else: 
+        print("CG has not converged")
+        print(f"Number of iterations: {check.niter}")
+
+    us = reconstruct_solutions(gbl_dofs_mngr, lambda_, assembler)
     write_output_subdomains(us)
